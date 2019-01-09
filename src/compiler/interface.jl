@@ -39,9 +39,12 @@ function forward(f, args...)
 end
 
 function gradient(f, args...)
+  # back here is the backpropagators.
+  # TODO: what is the type of back? why it is callable?
   y, back = forward(f, args...)
+
   y isa Real || error("Function output is not scalar")
-  return back(Int8(1))
+  return back(Int8(1)), back
 end
 
 derivative(f::F, x) where F = gradient(f, x)[1]

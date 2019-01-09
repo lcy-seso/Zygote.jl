@@ -119,6 +119,8 @@ varargs(m::Method, n) = m.isva ? n - m.nargs + 1 : nothing
 
 function _lookup_grad(T)
   (m = meta(T)) == nothing && return
+  
+  # by default, usetyped is false. This statement will directly return.
   usetyped && m.ret == Union{} && return
   va = varargs(m.method, length(T.parameters))
   forw, back = stacks!(Adjoint(IRCode(m), varargs = va), T)
