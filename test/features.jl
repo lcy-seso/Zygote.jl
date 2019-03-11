@@ -1,5 +1,5 @@
 using Zygote, Test
-using Zygote: Params, gradient, derivative, roundtrip
+using Zygote: Params, gradient, derivative, roundtrip, forwarddiff
 
 add(a, b) = a+b
 _relu(x) = x > 0 ? x : 0
@@ -156,9 +156,11 @@ D(f, x) = grad(f, x)[1]
 
 @test D(x -> D(sin, x), 0.5) == -sin(0.5)
 
-# FIXME segfaults on beta2 for some reason
-# @test D(x -> x*D(y -> x+y, 1), 1) == 1
-# @test D(x -> x*D(y -> x*y, 1), 4) == 8
+if VERSION > v"1.2-"
+  @test D(x -> x*D(y -> x+y, 1), 1) == 1
+  @test D(x -> x*D(y -> x*y, 1), 4) == 8
+  @test_broken sin'''(1.0) == -cos(1.0)
+end
 
 f(x) = throw(DimensionMismatch("fubar"))
 
@@ -225,4 +227,59 @@ if !Zygote.usetyped
   invokable(x) = 2x
   invokable(x::Integer) = 3x
   @test gradient(x -> invoke(invokable, Tuple{Any}, x), 5) == (2,)
+end
+
+y, back = Zygote.forward(x->tuple(x...), [1, 2, 3])
+@test back((1, 1, 1)) == ((1,1,1),)
+
+# Test for some compiler errors on complex CFGs
+function f(x)
+  while true
+    true && return
+    foo(x) && break
+  end
+end
+
+if VERSION >= v"1.1"
+  @test Zygote.@code_adjoint(f(1)) isa Zygote.Adjoint
+end
+
+@test_throws ErrorException Zygote.gradient(1) do x
+  push!([], x)
+  return x
+end
+
+if VERSION >= v"1.1"
+  @test gradient(1) do x
+    stk = []
+    Zygote._push!(stk, x)
+    stk = Zygote.Stack(stk)
+    pop!(stk)
+  end == (1,)
+end
+
+@test gradient(x -> [x][1].a, Foo(1, 1)) == ((a=1, b=nothing),)
+
+@test gradient((a, b) -> Zygote.hook(-, a)*b, 2, 3) == (-3, 2)
+
+@test gradient(5) do x
+  forwarddiff(x -> x^2, x)
+end == (10,)
+
+@test gradient(1) do x
+  if true
+  elseif true
+    nothing
+  end
+  x + x
+end == (2,)
+
+global_param = 3
+
+@testset "Global Params" begin
+  cx = Zygote.Context()
+  y, back = Zygote._forward(cx, x -> x*global_param, 2)
+  @test y == 6
+  @test back(1) == (nothing, 3)
+  Zygote.globals(cx)[GlobalRef(Main, :global_param)] == 2
 end

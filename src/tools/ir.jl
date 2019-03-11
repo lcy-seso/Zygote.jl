@@ -1,7 +1,7 @@
 import Core: SSAValue, GotoNode, Compiler
 import Core: Typeof
 import Core.Compiler: CodeInfo, IRCode, CFG, BasicBlock, Argument, ReturnNode,
-  NullLineInfo, just_construct_ssa, compact!, NewNode, InferenceState, OptimizationState,
+  just_construct_ssa, compact!, NewNode, InferenceState, OptimizationState,
   GotoIfNot, PhiNode, PiNode, StmtRange, IncrementalCompact, insert_node!, insert_node_here!,
   compact!, finish, DomTree, construct_domtree, dominates, userefs, widenconst, types, verify_ir
 using InteractiveUtils: typesof
@@ -27,10 +27,10 @@ function insert_blockend!(ir::IRCode, pos, typ, val)
   if !(ir.stmts[j] isa Union{GotoNode,GotoIfNot,ReturnNode})
     return insert_node!(ir, j, typ, val, true)
   end
-  while j > i && ir.stmts[j-1] isa Union{GotoNode,GotoIfNot,ReturnNode}
-    j -= 1
+  while i < j && !(ir.stmts[i] isa Union{GotoNode,GotoIfNot,ReturnNode})
+    i += 1
   end
-  insert_node!(ir, j, typ, val)
+  insert_node!(ir, i, typ, val)
 end
 
 function finish_dc(ic::IncrementalCompact)
@@ -60,12 +60,13 @@ exprtype(ir::IRCode, x::SSAValue) = widenconst(types(ir)[x])
 exprtype(ir::IRCode, x::GlobalRef) = isconst(x.mod, x.name) ? Typeof(getfield(x.mod, x.name)) : Any
 exprtype(ir::IRCode, x::QuoteNode) = Typeof(x.value)
 # probably can fall back to any here
-exprtype(ir::IRCode, x::Union{Type,Number,Nothing,Tuple,Function,Val,String}) = Typeof(x)
+exprtype(ir::IRCode, x::Union{Type,Number,Nothing,Tuple,Function,Val,String,Char,Module}) = Typeof(x)
 exprtype(ir::IRCode, x::Expr) = error(x)
 
 rename(x, m) = x
 rename(x::SSAValue, m) = m[x.id]
 rename(xs::AbstractVector, m) = map(x -> rename(x, m), xs)
+rename(xs::Tuple, m) = map(x -> rename(x, m), xs)
 rename(xs::AbstractSet, m) = Set(rename(x, m) for x in xs)
 rename(d::AbstractDict, m) = Dict(k => rename(v, m) for (k, v) in d)
 

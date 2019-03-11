@@ -47,9 +47,34 @@ function merge_returns(ir)
     push!(ir.cfg.blocks[b].succs, bb)
   end
   ir.stmts[r.id] = PhiNode(bs, xs)
-  ir = compact!(ir)
+  return compact!(ir)
+end
+
+function merge_entry(ir)
+  isempty(ir.cfg.blocks[1].preds) && return ir
+  ir = IncrementalCompact(ir)
+  insert_node_here!(ir, nothing, Nothing, Int32(0))
+  foreach(_ -> nothing, ir)
+  ir = finish(ir)
+  for i in 1:length(ir.cfg.blocks)
+    old = ir.cfg.blocks[i]
+    ir.cfg.blocks[i] = BasicBlock(old.stmts, old.preds .+ 1, old.succs .+ 1)
+  end
+  for i = 1:length(ir.stmts)
+    ex = ir.stmts[i]
+    ir.stmts[i] =
+      ex isa GotoNode ? GotoNode(ex.label+1) :
+      ex isa GotoIfNot ? GotoIfNot(ex.cond, ex.dest+1) :
+      ex
+  end
+  pushfirst!(ir.cfg.blocks, BasicBlock(StmtRange(1:1), [], [2]))
+  old = ir.cfg.blocks[2]
+  ir.cfg.blocks[2] = BasicBlock(StmtRange(2:last(old.stmts)), old.preds, old.succs)
+  pushfirst!(ir.cfg.blocks[2].preds, 1)
   return ir
 end
+
+normalise(ir) = ir |> merge_entry |> merge_returns
 
 struct Alpha
   id::Int
@@ -79,9 +104,12 @@ function record_branches!(ir::IRCode)
   return finish_dc(ir)
 end
 
-istrackable(x) =
-  x isa GlobalRef && x.mod ∉ (Base, Core) &&
-  !(isconst(x.mod, x.name) && typeof(getfield(x.mod, x.name)) <: Union{Function,Type})
+function istrackable(x)
+  x isa GlobalRef && x.mod ∉ (Base, Core) || return false
+  isconst(x.mod, x.name) || return true
+  x = getfield(x.mod, x.name)
+  !(x isa Type || sizeof(x) == 0)
+end
 
 function record_globals!(ir::IRCode)
   for i = 1:length(ir.stmts)
@@ -90,7 +118,7 @@ function record_globals!(ir::IRCode)
     if isexpr(ex, :call)
       for j = 1:length(ex.args)
         istrackable(ex.args[j]) || continue
-        ex.args[j] = insert_node!(ir, i, Any, xcall(Zygote, :unwrap, ex.args[j]))
+        ex.args[j] = insert_node!(ir, i, Any, xcall(Zygote, :unwrap, QuoteNode(ex.args[j]), ex.args[j]))
       end
     end
   end
@@ -144,6 +172,7 @@ function record!(ir::IRCode)
   for i = 1:length(ir.stmts)
     ex = argmap(x -> Argument(x.n+2), ir[SSAValue(i)])
     isexpr(ex, :new) && (ex = ir[SSAValue(i)] = xcall(Zygote, :__new__, ex.args...))
+    isexpr(ex, :splatnew) && (ex = ir[SSAValue(i)] = xcall(Zygote, :__splatnew__, ex.args...))
     is_literal_getproperty(ex) &&
       (ex = ir[SSAValue(i)] = xcall(Zygote, :literal_getproperty, ex.args[2], Val(ex.args[3].value)))
     if isexpr(ex, :call) && !ignored(ir, ex)
@@ -192,7 +221,7 @@ end
 Primal(ir::IRCode, xs, vs) = Primal(ir, reverse_order(ir.cfg), xs, vs)
 
 function Primal(ir::IRCode; varargs = nothing)
-  ir = merge_returns(ir)
+  ir = normalise(ir)
   forw, xs = record!(record_branches!(record_globals!(ir)))
   Primal(forw, xs, varargs)
 end
@@ -308,6 +337,12 @@ function reverse_ir(pr::Primal)
           ir.lines[j] = pr.forw.lines[i]
           push!(partials[x], dx)
         end
+      elseif isexpr(ex, :call, :isdefined, GotoIfNot, GotoNode, Nothing, GlobalRef)
+        # ignore it
+      else
+        desc = isexpr(ex) ? "$(ex.head) expression" : ex
+        insert_node!(ir, j, Any, xcall(Base, :error, "Can't differentiate $desc"))
+        ir.lines[j] = pr.forw.lines[i]
       end
     end
     if b == 1
@@ -353,13 +388,17 @@ function accumulators!(pr::Primal, ir::IRCode, grads, partials, phis)
     accums[(newblock(pr, b),x)] = p
   end
 
+  # Work around ordering issues with `accum` stmts and phis
+  ir, m = _compact!(ir)
+  accums, phis, grads, partials = rename((accums, phis, grads, partials), m)
+
   function predpartial(b, x)
     function blockpartial(b, c, x)
       if haskey(accums, (b, x))
         @assert !haskey(phis, (b, c, x)) "not implemented"
         return accums[(b, x)]
       elseif haskey(phis, (b, c, x))
-        return phis[b, c, x]
+        return phis[(b, c, x)]
       end
     end
     preds = ir.cfg.blocks[b].preds
@@ -393,8 +432,8 @@ end
 
 Adjoint(ir::IRCode; varargs = nothing) = Adjoint(Primal(ir, varargs = varargs))
 
-using InteractiveUtils: @which
+using InteractiveUtils
 
 macro code_adjoint(ex)
-  :(Adjoint($(code_irm(ex)), varargs = varargs($(esc(:(@which $ex))), length(($(esc.(ex.args)...),)))))
+  :(Adjoint($(code_irm(ex)), varargs = varargs($(esc(:($InteractiveUtils.@which $ex))), length(($(esc.(ex.args)...),)))))
 end

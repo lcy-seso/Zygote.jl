@@ -21,7 +21,7 @@ end
 # Core functions
 
 @nograd Core.apply_type, Core.typeof, nfields, fieldtype,
-  (==), (===), (>=), (<), (>), isempty
+  (==), (===), (>=), (<), (>), isempty, supertype, Base.typename, Base.parameter_upper_bound
 
 @adjoint (::Type{V})(x...) where V<:Val = V(x...), _ -> nothing
 
@@ -39,9 +39,24 @@ end
   end
 end
 
+function accum_global(cx::Context, ref, x̄)
+  gs = globals(cx)
+  gs[ref] = accum(get(gs, ref, nothing), x̄)
+  return
+end
+
 unwrap(x) = x
 
-@adjoint unwrap(x) = unwrap(x), Δ -> accum_param(__context__, x, Δ)
+@adjoint unwrap(x) = unwrap(x), x̄ -> (accum_param(__context__, x, x̄); (x̄,))
+
+unwrap(ref, x) = x
+
+# Right now we accumulate twice, for both implicit params and the `globals`
+# API. Eventually we'll deprecate implicit params.
+@adjoint unwrap(ref, x) = unwrap(x), function (x̄)
+  accum_global(__context__, ref, x̄)
+  accum_param(__context__, x, x̄)
+end
 
 # Tuples
 
@@ -59,9 +74,10 @@ unwrap(x) = x
   first(xs), Δ -> ((Δ, drest...),)
 end
 
-_empty(x) = nothing
-_empty(x::Tuple) = map(_empty, x)
+_empty(x) = length(x)
+_empty(x::Tuple) = map(_->nothing, x)
 
+_unapply(t::Integer, xs) = xs[1:t], xs[t+1:end]
 _unapply(t, xs) = first(xs), tail(xs)
 _unapply(t::Tuple{}, xs) = (), xs
 
@@ -75,7 +91,7 @@ unapply(t, xs) = _unapply(t, xs)[1]
 
 @adjoint function Core._apply(f, args...)
   y, back = Core._apply(_forward, (__context__, f), args...)
-  st = _empty(args)
+  st = map(_empty, args)
   y, function (Δ)
     Δ = back(Δ)
     (first(Δ), unapply(st, Base.tail(Δ))...)
@@ -161,7 +177,14 @@ end
   end
 end
 
-struct Jnew{T,G}
+@generated function __splatnew__(T, args)
+  quote
+    Base.@_inline_meta
+    $(Expr(:splatnew, :T, :args))
+  end
+end
+
+struct Jnew{T,G,splat}
   g::G
 end
 
@@ -170,12 +193,24 @@ Jnew{T}(g) where T = Jnew{T,typeof(g)}(g)
 @adjoint! function __new__(T, args...)
   x = __new__(T, args...)
   g = !T.mutable || fieldcount(T) == 0 ? nothing : grad_mut(__context__, x)
-  x, Jnew{T}(g)
+  x, Jnew{T,typeof(g),false}(g)
+end
+
+@adjoint! function __splatnew__(T, args)
+  x = __splatnew__(T, args)
+  g = !T.mutable || fieldcount(T) == 0 ? nothing : grad_mut(__context__, x)
+  x, Jnew{T,typeof(g),true}(g)
 end
 
 # TODO captured mutables + multiple calls to `back`
-@generated function (back::Jnew{T,G})(Δ::Union{NamedTuple,Nothing}) where {T,G}
+@generated function (back::Jnew{T,G,false})(Δ::Union{NamedTuple,Nothing}) where {T,G}
   !T.mutable && Δ == Nothing && return :nothing
   Δ = G == Nothing ? :Δ : :(back.g)
   :(nothing, $(map(f -> :(deref!($Δ.$f)), fieldnames(T))...))
+end
+
+@generated function (back::Jnew{T,G,true})(Δ::Union{NamedTuple,Nothing}) where {T,G}
+  !T.mutable && Δ == Nothing && return :nothing
+  Δ = G == Nothing ? :Δ : :(back.g)
+  :(nothing, ($(map(f -> :(deref!($Δ.$f)), fieldnames(T))...),))
 end
